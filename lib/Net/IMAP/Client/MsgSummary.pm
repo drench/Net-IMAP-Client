@@ -2,6 +2,8 @@ package Net::IMAP::Client::MsgSummary;
 
 use Net::IMAP::Client::MsgAddress ();
 
+use Encode ();
+
 sub new {
     my ($class, $data, $part_id) = @_;
     bless my $self = {}, $class;
@@ -32,6 +34,14 @@ sub new {
     return $self;
 }
 
+sub _decode {
+    my ($str) = @_;
+    if (defined($str)) {
+        eval { $str = Encode::decode('MIME-Header', $str); };
+    }
+    return $str;
+}
+
 sub type { $_[0]->{type} }
 
 sub subtype { $_[0]->{subtype} }
@@ -40,13 +50,22 @@ sub parameters { $_[0]->{parameters} }
 
 sub cid { $_[0]->{cid} }
 
-sub description { $_[0]->{description} }
+sub description { _decode($_[0]->{description}) }
 
 sub transfer_encoding { $_[0]->{transfer_encoding} }
 
 sub encoded_size { $_[0]->{encoded_size} }
 
-sub content_type { "$_[0]->{type}/$_[0]->{subtype}" }
+sub content_type {
+    my ($self) = @_;
+    if ($self->type) {
+        return $self->type . '/' . $self->subtype;
+    }
+    if ($self->multipart) {
+        return 'multipart/' . $self->multipart;
+    }
+    return undef;
+}
 
 sub charset { $_[0]->{parameters}->{charset} }
 
@@ -65,8 +84,10 @@ sub filename {
     unless ($filename) {
         $filename = $_[0]->{parameters}->{name};
     }
-    return $filename;
+    return _decode($filename);
 }
+
+sub name { _decode($_[0]->{parameters}->{name}) }
 
 sub multipart { lc $_[0]->{multipart_type} }
 
@@ -92,7 +113,7 @@ sub language { $_[0]->{language} }
 
 sub date { $_[0]->{date} }
 
-sub subject { $_[0]->{subject} }
+sub subject { _decode($_[0]->{subject}) }
 
 sub from { $_[0]->{from} }
 
@@ -128,6 +149,8 @@ sub has_attachments {
     return $mt && $MT_HAS_ATTACHMENT{$mt} ? 1 : 0;
 }
 
+sub is_message { $_[0]->content_type eq 'message/rfc822' }
+
 sub _parse_body {
     my ($self, $struct) = @_;
 
@@ -153,7 +176,7 @@ sub _parse_body {
         $self->{transfer_encoding} = $struct->[5];
         $self->{encoded_size} = $struct->[6];
 
-        if ($self->content_type eq 'message/rfc822') {
+        if ($self->is_message) {
             # continue parsing attached message
             $self->_parse_envelope($struct->[7]);
             $self->_parse_body($struct->[8]);
@@ -192,7 +215,7 @@ sub _parse_bodystructure {
         $self->{transfer_encoding} = $struct->[5];
         $self->{encoded_size} = $struct->[6];
 
-        if ($self->content_type eq 'message/rfc822') {
+        if ($self->is_message) {
             # continue parsing attached message
             $self->_parse_envelope($struct->[7]);
             $self->_parse_bodystructure($struct->[8]);
@@ -286,8 +309,8 @@ Net::IMAP::Client.
 
     my $summary = shift @summaries;
 
-    print Encode::decode('MIME-Header', $summary->subject);
-    print Encode::decode('MIME-Header', $summary->from->[0]);
+    print $summary->subject;
+    print $summary->from->[0];
 
 =head1 DESCRIPTION
 
@@ -312,7 +335,8 @@ example.
 =head1 API REFERENCE
 
 It contains only accessors that return data as retrieved by the FETCH
-command (i.e. you need to undecode it).
+command.  Parts that may be MIME-word encoded are automatically
+undecoded.
 
 =head2 C<new>  # constructor
 
@@ -360,9 +384,14 @@ Shortcut for C<$self->type . '/' .$self->subtype>.
 
 Returns the charset declaration for this part.
 
+=item C<name>
+
+Returns the name of this part, if found in FETCH response.
+
 =item C<filename>
 
-Returns the file name of this part, if found in FETCH response.
+Returns the file name of this part, if found in FETCH response.  If
+there's no filename it will try C<name>.
 
 =item C<multipart>
 
@@ -458,6 +487,13 @@ return the text/html part of the attached message.
 
 Tries to determine if this message has attachments.  For now this
 checks if the multipart type is 'mixed', which isn't really accurate.
+
+=item C<is_message>
+
+Returns true if this object represents a message (i.e. has
+content_type eq 'message/rfc822').  Note that it won't return true for
+the toplevel part, but you B<know> that that part represents a
+message. ;-)
 
 =back
 

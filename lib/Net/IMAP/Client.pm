@@ -1,22 +1,24 @@
 package Net::IMAP::Client;
 
 use vars qw[$VERSION];
-$VERSION = '0.1';
+$VERSION = '0.2';
 
-use List::Util qw( min max );
+use strict;
+use warnings;
+
+use List::Util qw( min max first );
 use IO::Socket::INET ();
 use IO::Socket::SSL ();
-
-use Time::HiRes qw( gettimeofday tv_interval );
 
 use Net::IMAP::Client::MsgSummary ();
 
 our $SYSREAD_BUFFER = 4096;
-my %UID_COMMANDS = map { $_ => 1 } qw( COPY FETCH STORE SEARCH SORT );
+my %UID_COMMANDS = map { $_ => 1 } qw( COPY FETCH STORE SEARCH SORT THREAD );
 my %DEFAULT_ARGS = (
     uid_mode => 1,
     timeout  => 90,
     server   => '127.0.0.1',
+    port     => undef,
     user     => undef,
     pass     => undef,
     ssl      => 0,
@@ -33,6 +35,7 @@ sub new {
 
     bless $self, $class;
 
+    $self->{notifications} = [];
     $self->{greeting} = $self->_socket_getline;
     return $self;
 }
@@ -58,6 +61,8 @@ sub login {
     my ($self, $user, $pass) = @_;
     $user ||= $self->{user};
     $pass ||= $self->{pass};
+    $self->{user} = $user;
+    $self->{pass} = $pass;
     _string_quote($user);
     _string_quote($pass);
     my ($ok) = $self->_tell_imap(LOGIN => "$user $pass");
@@ -74,6 +79,24 @@ sub logout {
 
 *quit = \&logout;
 
+sub capability {
+    my ($self, $requirement) = @_;
+    my $capability = $self->{capability};
+    unless ($capability) {
+        my ($ok, $lines) = $self->_tell_imap('CAPABILITY');
+        if ($ok) {
+            my $line = $lines->[0][0];
+            if ($line =~ /^\*\s+CAPABILITY\s+(.*?)\s*$/) {
+                $capability = $self->{capability} = [ split(/\s+/, $1) ];
+            }
+        }
+    }
+    if ($requirement && $capability) {
+        return first { $_ =~ $requirement } @$capability;
+    }
+    return $capability;
+}
+
 sub status {
     my $self = shift;
     my $a;
@@ -81,26 +104,28 @@ sub status {
     if (ref($_[0]) eq 'ARRAY') {
         my @tmp = @{$_[0]};
         $a = \@tmp;
-    } elsif (@_ > 1) {
-        $a = [ @_ ];
     } else {
-        $a = [ @_ ];
+        $a = [ shift ];
         $wants_one = 1;
     }
     foreach (@$a) {
         _string_quote($_);
         $_ = "STATUS $_ (MESSAGES RECENT UNSEEN UIDNEXT UIDVALIDITY)";
     }
-    my $ret = $self->_tell_imap2(@$a);
-    foreach (@$ret) {
-        my $tokens = _parse_tokens($_->[1]->[0]);
-        my $name = $tokens->[2];
-        $tokens = $tokens->[3];
-        my %tmp = @$tokens;
-        $tmp{name} = $name;
-        $_ = \%tmp;
+    my $results = $self->_tell_imap2(@$a);
+    my %ret;
+    my $name;
+    foreach my $i (@$results) {
+        if ($i->[0]) {          # was successful?
+            my $tokens = _parse_tokens($i->[1]->[0]);
+            $name = $tokens->[2];
+            $tokens = $tokens->[3];
+            my %tmp = @$tokens;
+            $tmp{name} = $name;
+            $ret{$name} = \%tmp;
+        }
     }
-    return wantarray ? @$ret : $wants_one ? $ret->[0] : $ret;
+    return $wants_one ? $ret{$name} : \%ret;
 }
 
 sub select {
@@ -109,21 +134,22 @@ sub select {
     _string_quote($quoted);
     my ($ok, $lines) = $self->_tell_imap(SELECT => $quoted);
     if ($ok) {
+        $self->{selected_folder} = $folder;
         my %info = ();
         foreach my $tmp (@$lines) {
             my $line = $tmp->[0];
             if ($line =~ /^\*\s+(\d+)\s+EXISTS/i) {
-                $info{messages} = $1;
+                $info{messages} = $1 + 0;
             } elsif ($line =~ /^\*\s+FLAGS\s+\((.*?)\)/i) {
                 $info{flags} = [ split(/\s+/, $1) ];
             } elsif ($line =~ /^\*\s+(\d+)\s+RECENT/i) {
-                $info{recent} = $1;
+                $info{recent} = $1 + 0;
             } elsif ($line =~ /^\*\s+OK\s+\[(.*?)\s+(.*?)\]/i) {
                 my ($flag, $value) = ($1, $2);
                 if ($value =~ /\((.*?)\)/) {
                     $info{sflags}->{$flag} = [split(/\s+/, $1)];
                 } else {
-                    $info{oflags}->{$flag} = $value;
+                    $info{sflags}->{$flag} = $value;
                 }
             }
         }
@@ -158,6 +184,47 @@ sub folders {
     return undef;
 }
 
+sub folders_more {
+    my ($self) = @_;
+    my ($ok, $lines) = $self->_tell_imap(LIST => '"" "*"');
+    if ($ok) {
+        my %ret = map {
+            my $tokens = _parse_tokens($_);
+            my $flags = $tokens->[2];
+            my $sep   = $tokens->[3];
+            my $name  = $tokens->[4];
+            ( $name, { flags => $flags, sep => $sep } );
+        } @$lines;
+        return \%ret;
+    }
+    return undef;
+}
+
+sub noop {
+    my ($self) = @_;
+    my ($ok) = $self->_tell_imap('NOOP', undef, 1);
+    return $ok;
+}
+
+sub seq_to_uid {
+    my ($self, @seq_ids) = @_;
+    my $ids = join(',', @seq_ids);
+
+    my $save_uid_mode = $self->uid_mode;
+    $self->uid_mode(0);
+    my ($ok, $lines) = $self->_tell_imap(FETCH => "$ids UID", 1);
+    $self->uid_mode($save_uid_mode);
+
+    if ($ok) {
+        my %ret = map {
+            $_->[0] =~ /^\*\s+(\d+)\s+FETCH\s*\(\s*UID\s+(\d+)/
+              && ( $1, $2 );
+        } @$lines;
+        return \%ret;
+    }
+    return undef;
+}
+
 sub search {
     my ($self, $criteria, $sort, $charset) = @_;
 
@@ -188,14 +255,13 @@ sub search {
         $criteria = '(' . join(' ', @a) . ')';
     }
 
-    my ($ok, $lines) = $self->_tell_imap($cmd => "$sort$charset $criteria");
+    my ($ok, $lines) = $self->_tell_imap($cmd => "$sort$charset $criteria", 1);
     if ($ok) {
         # it makes no sense to employ the full token parser here
         my $line = $lines->[0]->[0];
         $line =~ s/^\*\s+(?:SEARCH|SORT)\s+//ig;
         $line =~ s/\s*$//g;
-        my @a = map { $_ } split(/\s+/, $line);
-        return wantarray ? @a : \@a;
+        return [ map { $_ + 0 } split(/\s+/, $line) ];
     }
 
     return undef;
@@ -203,22 +269,42 @@ sub search {
 
 sub get_rfc822_body {
     my ($self, $msg) = @_;
+    my $wants_many = undef;
     if (ref($msg) eq 'ARRAY') {
         $msg = join(',', @$msg);
+        $wants_many = 1;
     }
-    my ($ok, $lines) = $self->_tell_imap(FETCH => "$msg RFC822");
+    my ($ok, $lines) = $self->_tell_imap(FETCH => "$msg RFC822", 1);
     if ($ok) {
         my @ret = map { $_->[1] } @$lines;
-        return wantarray ? @ret : scalar(@ret) > 1 ? \@ret : $ret[0];
+        return $wants_many ? \@ret : $ret[0];
     }
     return undef;
 }
 
 sub get_part_body {
     my ($self, $msg, $part) = @_;
-    my ($ok, $lines) = $self->_tell_imap(FETCH => "$msg BODY[$part]");
+    my ($ok, $lines) = $self->_tell_imap(FETCH => "$msg BODY[$part]", 1);
     if ($ok) {
         return $lines->[0]->[1];
+    }
+    return undef;
+}
+
+sub get_parts_bodies {
+    my ($self, $msg, $parts) = @_;
+    $parts = join(' ', map { "BODY[$_]" } @$parts);
+    my ($ok, $lines) = $self->_tell_imap(FETCH => "$msg ($parts)", 1);
+    if ($ok) {
+        my $a = $lines->[0];
+        my %ret = ();
+        for (my $i = 0; $i < @$a;) {
+            my ($foo, $bar) = ($a->[$i++], $a->[$i++]);
+            if ($foo =~ /BODY\[(.*?)\]\s*$/) {
+                $ret{$1} = $bar;
+            }
+        }
+        return \%ret;
     }
     return undef;
 }
@@ -231,10 +317,15 @@ sub get_summaries {
     } elsif (ref $msg eq 'ARRAY') {
         $msg = join(',', @$msg);
     }
-    my ($ok, $lp) = $self->_tell_imap(FETCH => qq[$msg (FLAGS INTERNALDATE RFC822.SIZE ENVELOPE BODYSTRUCTURE)]);
+    my ($ok, $lp) = $self->_tell_imap(FETCH => qq[$msg (UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE BODYSTRUCTURE)], 1);
     if ($ok) {
-        my @ret = map { _make_summary(_parse_tokens($_)) } @$lp;
-        return wantarray ? @ret : scalar(@ret) > 1 ? \@ret : $ret[0];
+        my @ret;
+        foreach (@$lp) {
+            my $summary = $self->_make_summary(_parse_tokens($_));
+            push @ret, $summary
+              if $summary;
+        }
+        return \@ret;
     } else {
         return undef;
     }
@@ -243,6 +334,13 @@ sub get_summaries {
 sub last_error {
     my ($self) = @_;
     return $self->{_error};
+}
+
+sub notifications {
+    my ($self) = @_;
+    my $tmp = $self->{notifications};
+    $self->{notifications} = [];
+    return wantarray ? @$tmp : $tmp;
 }
 
 ##### internal stuff #####
@@ -328,10 +426,10 @@ sub _cmd_ok {
 sub _cmd_ok2 {
     my ($self, $res) = @_;
 
-    if ($res =~ /^(NIC[0-9]+)\s+OK/i) {
+    if ($res =~ /^(NIC\d+)\s+OK/i) {
         my $id = $1;
         return ($id, 1);
-    } elsif ($res =~ /^(NIC[0-9]+)\s+(?:NO|BAD)(?:\s+(.+))?/i) {
+    } elsif ($res =~ /^(NIC\d+)\s+(?:NO|BAD)(?:\s+(.+))?/i) {
         my $id = $1;
         my $error = $2 || 'unknown error';
         return ($id, 0, $error);
@@ -340,18 +438,20 @@ sub _cmd_ok2 {
 }
 
 sub _tell_imap {
-    my ($self, @cmd) = @_;
+    my ($self, $cmd, $args, $do_notf) = @_;
 
-    $self->_send_cmd(@cmd);
+    $cmd = uc $cmd;
+    $self->_send_cmd($cmd, $args);
 
     my $lineparts = [];
     my $ok;
     while (my $res = $self->_socket_getline) {
+        # print STDERR "$res";
         if ($res =~ /^\*/) {
             push @$lineparts, []; # this is a new line interesting in itself
         }
         if ($res =~ /(.*)\{(\d+)\}\r\n/) {
-            my ($line, $len) = ($1, $2);
+            my ($line, $len) = ($1, $2 + 0);
             push @{$lineparts->[-1]},
               $line,
                 $self->_read_literal($len);
@@ -362,6 +462,35 @@ sub _tell_imap {
             } else {
                 push @{$lineparts->[-1]}, $res;
             }
+        }
+    }
+
+    if ($do_notf) {
+        no warnings 'uninitialized';
+        for (my $i = scalar(@$lineparts); --$i >= 0;) {
+            my $line = $lineparts->[$i];
+
+            # 1. notifications don't contain literals
+            last if scalar(@$line) != 1;
+
+            my $text = $line->[0];
+
+            # 2. FETCH notifications only contain FLAGS.  We make a
+            #    promise never to FETCH flags alone intentionally.
+
+            # 3. Other notifications will have a first token different
+            #    from the running command
+
+            if ( $text =~ /^\*\s+\d+\s+FETCH\s*\(\s*FLAGS\s*\(.*?\)\)/
+                   || $text !~ /^\*\s+(?:\d+\s+)?$cmd/ ) {
+                my $tokens = _parse_tokens($line);
+                if ($self->_handle_notification($tokens, 1)) {
+                    splice @$lineparts, $i, 1;
+                }
+                next;
+            }
+
+            last;
         }
     }
 
@@ -384,6 +513,7 @@ sub _tell_imap2 {
     for (0..$#cmd) {
         my $lineparts = [];
         while (my $res = $self->_socket_getline) {
+            # print STDERR "2: $res";
             if ($res =~ /^\*/) {
                 push @$lineparts, []; # this is a new line interesting in itself
             }
@@ -456,11 +586,11 @@ sub _parse_tokens {
         }
         while (1) {
             $text =~ m/\G\s+/gc;
-            if ($text =~ m/\G\(/gc) {
+            if ($text =~ m/\G[([]/gc) {
                 my $sub = [];
                 push @{$stack[-1]}, $sub;
                 push @stack, $sub;
-            } elsif ($text =~ m/\G\)/gc) {
+            } elsif ($text =~ m/\G[])]/gc) {
                 pop @stack;
             } elsif ($text =~ m/\G\"((?:\\.|[^\"\\])*)\"/gc) {
                 my $str = $1;
@@ -468,9 +598,8 @@ sub _parse_tokens {
                 $str =~ s/\\\"/\"/g;
                 $str =~ s/\\\\/\\/g;
                 push @{$stack[-1]}, $str; # found string
-            } elsif ($text =~ m/\G([0-9]+)/gc) {
-                my $atom = $1 + 0; # force numeric!
-                push @{$stack[-1]}, $atom; # found atom
+            } elsif ($text =~ m/\G(\d+)/gc) {
+                push @{$stack[-1]}, $1 + 0; # found numeric
             } elsif ($text =~ m/\G([a-zA-Z0-9_\$\\.+\/*-]+)/gc) {
                 my $atom = $1;
                 if (lc $atom eq 'nil') {
@@ -487,11 +616,78 @@ sub _parse_tokens {
 }
 
 sub _make_summary {
-    my ($tokens) = @_;
+    my ($self, $tokens) = @_;
     ## in form: [ '*', ID, 'FETCH', [ tokens ]]
-    $tokens = $tokens->[3];
-    my %hash = @$tokens;
-    return Net::IMAP::Client::MsgSummary->new(\%hash);
+
+    if ($tokens->[2] eq 'FETCH') {
+        my %hash = @{$tokens->[3]};
+        if ($hash{ENVELOPE}) {
+            # full fetch
+            return Net::IMAP::Client::MsgSummary->new(\%hash);
+        } else {
+            # 'FETCH' (probably FLAGS) notification!
+            $self->_handle_notification($tokens);
+            return undef;
+        }
+    } else {
+        # notification!
+        $self->_handle_notification($tokens);
+        return undef;
+    }
+}
+
+sub _handle_notification {
+    my ($self, $tokens, $reverse) = @_;
+
+    no warnings 'uninitialized';
+    my $not;
+
+    my $sf = $self->{selected_folder};
+    if ($sf) { # otherwise we shouldn't get any notifications, but whatever
+        $sf = $self->{FOLDERS}{$sf};
+        if ($tokens->[2] eq 'FETCH') {
+            my %data = @{$tokens->[3]};
+            if (my $flags = $data{FLAGS}) {
+                $not = { seq   => $tokens->[1] + 0,
+                         flags => $flags };
+                if (first { $_ eq '\\Deleted' } @$flags) {
+                    --$sf->{messages};
+                    $not->{deleted} = 1;
+                }
+            }
+
+        } elsif ($tokens->[2] eq 'EXISTS') {
+            $sf->{messages} = $tokens->[1] + 0;
+            $not = { messages => $tokens->[1] + 0 };
+
+        } elsif ($tokens->[2] eq 'EXPUNGE') {
+            --$sf->{messages};
+            $not = { seq => $tokens->[1] + 0, destroyed => 1 };
+
+        } elsif ($tokens->[2] eq 'RECENT') {
+            $sf->{recent} = $tokens->[1] + 0;
+            $not = { recent => $tokens->[1] + 0 };
+
+        } elsif ($tokens->[1] eq 'FLAGS') {
+            $sf->{flags} = $tokens->[2];
+            $not = { flags => $tokens->[2] };
+
+        } elsif ($tokens->[1] eq 'OK') {
+            $sf->{sflags}{$tokens->[2][0]} = $tokens->[2][1];
+        }
+    }
+
+    if (defined $not) {
+        $not->{folder} = $self->{selected_folder};
+        if ($reverse) {
+            unshift @{$self->{notifications}}, $not;
+        } else {
+            push @{$self->{notifications}}, $not;
+        }
+        return 1;
+    }
+
+    return 0;
 }
 
 1;
@@ -518,14 +714,20 @@ Net::IMAP::Client - Not so simple IMAP client library
         port   => 993         # (but defaults are sane)
     );
 
+    # everything's useless if you can't login
     $imap->login or
       die('Login failed: ' . $imap->last_error);
+
+    # let's see what this server knows (result cached on first call)
+    my $capab = $imap->capability;
+       # or
+    my $knows_sort = $imap->capability( qr/^sort/i );
 
     # get list of folders
     my @folders = $imap->folders;
 
     # get total # of messages, # of unseen messages etc. (fast!)
-    my @status = $imap->status(@folders);
+    my $status = $imap->status(@folders); # hash ref!
 
     # select folder
     $imap->select('INBOX');
@@ -538,7 +740,7 @@ Net::IMAP::Client - Not so simple IMAP client library
 
     # fetch all ID-s sorted by subject
     my $messages = $imap->search('ALL', 'SUBJECT');
-       or
+       # or
     my @messages = $imap->search('ALL', [ 'SUBJECT' ]);
 
     # fetch ID-s that match criteria, sorted by subject and reverse date
@@ -575,7 +777,7 @@ The code is simple, clean and extensible.
 
 It started as an effort to improve L<Net::IMAP::Simple> but then I
 realized that I needed to change a lot of code and API so I started it
-as a fresh module.  Nevertheless, the design is influenced by
+as a fresh module.  Still, the design is influenced by
 Net::IMAP::Simple and I even stole a few lines of code from it ;-)
 (very few, honestly).
 
@@ -640,6 +842,27 @@ Returns I<undef> if login failed.
 Send EXPUNGE and LOGOUT then close connection.  C<quit> is an alias
 for C<logout>.
 
+=head2 noop
+
+"Do nothing" method that calls the IMAP "NOOP" command.  It returns a
+true value upon success, L<undef> otherwise.
+
+This method fetches any notifications that the server might have for
+us and you can get them by calling $imap->notifications.  See the
+L<notifications()> method.
+
+=head2 capability(), capability( qr/^SOMETHING/ )
+
+With no arguments, returns an array of all capabilities advertised by
+the server.  If you're interested in a certain capability you can pass
+a RegExp.  E.g. to check if this server knows 'SORT', you can do this:
+
+    if ($imap->capability(/^sort$/i)) {
+        # speaks it
+    }
+
+This data is cached, the server will be only hit once.
+
 =head2 select( $folder )
 
 Selects the current IMAP folder.  On success this method also records
@@ -661,7 +884,7 @@ Flags available for this folder (as array ref)
 
 Total number of recent messages in this folder
 
-=item - B<sflags>, B<oflags>
+=item - B<sflags>
 
 Various other flags here, such as PERMANENTFLAGS of UIDVALIDITY.  You
 might want to take a look at RFC2060 at this point. :-p
@@ -670,27 +893,27 @@ might want to take a look at RFC2060 at this point. :-p
 
 This method is basically stolen from Net::IMAP::Simple.
 
-=head2 status( $folder ), status( @folders ), status( \@folders )
+=head2 status( $folder ), status( \@folders )
 
 Returns the status of the given folder(s).
 
-In scalar context it returns an array ref if multiple folders were
-queried, or the status for a single folder otherwise.  In list context
-it returns an array with the requested data.
+If passed an array ref, the return value is a hash ref mapping folder
+name to folder status (which are hash references in turn).  If passed
+a single folder name, it returns the status of that folder only.
 
     my $inbox = $imap->status('INBOX');
     print $inbox->{UNSEEN}, $inbox->{MESSAGES};
     print Data::Dumper::Dumper($inbox);
 
-    my @all = $imap->status($imap->folders);
-    foreach (@all) {
-        print "$_->{name} : $_->{MESSAGES}/$_->{UNSEEN}\n";
+    my $all = $imap->status($imap->folders);
+    while (my ($name, $status) = each %$all) {
+        print "$name : $status->{MESSAGES}/$status->{UNSEEN}\n";
     }
 
 This method is designed to be very fast when passed multiple folders.
 It's I<a lot> faster to call:
 
-    $imap->status(@folders);
+    $imap->status(\@folders);
 
 than:
 
@@ -721,11 +944,33 @@ context it returns a reference to an array, i.e.:
     my $b = $imap->folders;
     # now @a == @$b;
 
+=head2 folders_more
+
+Returns an hash reference containing more information about folders.
+It maps folder name to an hash ref containing the following:
+
+  - flags -- folder flags (array ref; i.e. [ '\\HasChildren' ])
+  - sep   -- one character containing folder hierarchy separator
+  - name  -- folder name (same as the key -- thus redundant)
+
+=head2 seq_to_uid( @sequence_ids )
+
+I recomment usage of UID-s only (see L<uid_mode>) but this isn't
+always possible.  Even when C<uid_mode> is on, the server will
+sometimes return notifications that only contain message sequence
+numbers.  To convert these to UID-s you can use this method.
+
+On success it returns an hash reference which maps sequence numbers to
+message UID-s.  Of course, on failure it returns I<undef>.
+
 =head2 search( $criteria, $sort, $charset )
 
 Executes the "SEARCH" or "SORT" IMAP commands (depending on wether
-$sort is I<undef>) and returns the results as a list (or array ref in
-scalar context) containing message ID-s.
+$sort is I<undef>) and returns the results as an array reference
+containing message ID-s.
+
+Note that if you use C<$sort> and the IMAP server doesn't have this
+capability, this method will fail.  Use L<capability> to investigate.
 
 =over
 
@@ -786,9 +1031,6 @@ servers.
 
 =back
 
-This method returns a list (or an array reference, in scalar context)
-of message ID-s that match the search criteria.
-
 =head2 get_rfc822_body( $msg_id )
 
 Fetch and return the full RFC822 body of the message.  B<$msg_id> can
@@ -840,7 +1082,18 @@ way to decode it is use Email::MIME::Encodings, i.e.:
 
 See get_summaries below.
 
-=head2 get_summaries( $msg )
+=head2 get_parts_bodies( $msg_id, \@part_ids )
+
+Similar to get_part_body, but this method is capable to retrieve more
+parts at once.  It's of course faster than calling get_part_body for
+each part alone.  Returns an hash reference which maps part ID to part
+body (the latter is a reference to a scalar containing the actual
+data).  Again, the data is not unencoded.
+
+    my $parts = $imap->get_parts_bodies(10, [ '1.1', '1.2', '2.1' ]);
+    print ${$parts->{'1.1'}};
+
+=head2 get_summaries( $msg ), get_summaries( \@msgs )
 
 Fetches, parses and returns "message summaries".  $msg can be an array
 ref, or a single id.  The return value is an array reference (in
@@ -1032,11 +1285,6 @@ message.
 As you can see, the parser retrieves all data, including from the
 embedded messages.
 
-Note that textual values are "MIME word"-encoded.  You need to call
-i.e. Encode::decode('MIME-Header', $summary->subject) to make sure
-it's decoded.  See L<Net::IMAP::Client::MsgSummary> for more
-information on this.
-
 There are many other modules you can use to fetch such information.
 L<Email::Simple> and L<Email::MIME> are great.  The only problem is
 that you have to have fetched already the full (RFC822) body of the
@@ -1046,6 +1294,50 @@ command and retrieve only those headers that you are interested in
 (instead of full body).  C<get_summaries> does exactly that (issues a
 FETCH (FLAGS INTERNALDATE RFC822.SIZE ENVELOPE BODYSTRUCTURE)).  It's
 acceptably fast even for huge folders.
+
+=head2 notifications()
+
+The IMAP server may send various notifications upon execution of
+commands.  They are collected in an array which is returned by this
+method (returns an array ref in scalar context, or a list otherwise).
+It clears the notifications queue so on second call it will return an
+empty array (unless new notifications were collected in the meantime).
+
+Each element in this array (notification) is a hash reference
+containing one or more or the following:
+
+  - seq       : the *sequence number* of the changed message
+  - flags     : new flags for this message
+  - deleted   : when the \Deleted flag was set for this message
+  - messages  : new number of messages in this folder
+  - recent    : number of recent messages in this folder
+  - flags     : new flags of this folder (seq is missing)
+  - destroyed : when this message was expunged
+  - folder    : the name of the selected folder
+
+C<folder> is always present.  C<seq> is present when a message was
+changed some flags (in which case you have C<flags>) or was expunged
+(in which case C<destroyed> is true).  When C<flags> were changed and
+the B<\Deleted> flag is present, you also get C<deleted> true.
+
+C<seq> is a message sequence number.  Pretty dumb, I think it's
+preferable to work with UID-s, but that's what the IMAP server
+reports.  To get UID-s call seq_to_uid.
+
+When C<flags> is present but no C<seq>, it means that the list of
+available flags for the C<folder> has changed.
+
+You get C<messages> upon an "EXISTS" notification, which usually means
+"you have new mail".  It indicates the total number of messages in the
+folder, not just "new" messages.  I've yet to come up with a good way
+to measure the number of new/unseen messages, other than calling
+C<status($folder)>.
+
+I rarely got C<recent> from my IMAP server in my tests; if more
+clients are simultaneously logged in as the same IMAP user, only one
+of them will receive "RECENT" notifications; others will have to rely
+on "EXISTS" to tell when new messages have arrived.  Therefore I can
+only say that "RECENT" is useless and I advise you to ignore it.
 
 =head1 TODO
 

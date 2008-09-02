@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:                Net-IMAP-Client
-version:             0.1
+version:             0.2
 abstract:            Not so simple IMAP client library
 license:             ~
 author:              
@@ -8,6 +8,9 @@ author:
 generated_by:        ExtUtils::MakeMaker version 6.42
 distribution_type:   module
 requires:     
+    IO::Socket::INET:              0
+    IO::Socket::SSL:               0
+    List::Util:                    0
     Test::More:                    0
 meta-spec:
     url:     http://module-build.sourceforge.net/META-spec-v1.3.html

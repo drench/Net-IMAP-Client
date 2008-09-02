@@ -1,5 +1,7 @@
 package Net::IMAP::Client::MsgAddress;
 
+use Encode ();
+
 sub new {
     my ($class, $struct) = @_;
     my $self = {
@@ -11,16 +13,24 @@ sub new {
     bless $self, $class;
 }
 
+sub _decode {
+    my ($str) = @_;
+    if (defined($str)) {
+        eval { $str = Encode::decode('MIME-Header', $str); };
+    }
+    return $str;
+}
+
 use overload q("") => \&as_string;
 
-sub name { $_[0]->{name} }
-sub at_domain_list { $_[0]->{at_domain_list} }
-sub mailbox { $_[0]->{mailbox} }
-sub host { $_[0]->{host} }
+sub name { _decode($_[0]->{name}) }
+sub at_domain_list { _decode($_[0]->{at_domain_list}) }
+sub mailbox { _decode($_[0]->{mailbox}) }
+sub host { _decode($_[0]->{host}) }
 
 sub email {
     my ($self) = @_;
-    return "$self->{mailbox}\@$self->{host}";
+    return $self->mailbox . '@' . $self->host;
 }
 
 sub as_string {
