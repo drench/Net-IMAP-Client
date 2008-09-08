@@ -1,7 +1,7 @@
 package Net::IMAP::Client;
 
 use vars qw[$VERSION];
-$VERSION = '0.2';
+$VERSION = '0.2.1';
 
 use strict;
 use warnings;
@@ -36,14 +36,18 @@ sub new {
     bless $self, $class;
 
     $self->{notifications} = [];
-    $self->{greeting} = $self->_socket_getline;
-    return $self;
+    eval {
+        $self->{greeting} = $self->_socket_getline;
+    };
+    return $@ ? undef : $self;
 }
 
 sub DESTROY {
     my ($self) = @_;
-    $self->quit
-      if $self->_get_socket->opened;
+    eval {
+        $self->quit
+          if $self->_get_socket->opened;
+    };
 }
 
 sub uid_mode {
@@ -707,12 +711,14 @@ Net::IMAP::Client - Not so simple IMAP client library
     use Net::IMAP::Client;
 
     my $imap = Net::IMAP::Client->new(
+
         server => 'mail.you.com',
         user   => 'USERID',
         pass   => 'PASSWORD',
         ssl    => 1,          # (use SSL? default no)
         port   => 993         # (but defaults are sane)
-    );
+
+    ) or die "Could not connect to IMAP server";
 
     # everything's useless if you can't login
     $imap->login or
