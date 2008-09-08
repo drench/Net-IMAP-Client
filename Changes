@@ -1,6 +1,6 @@
 Revision history for Net-IMAP-Client
 
-0.2.1    Sep 08, 2008
+0.3      Sep 08, 2008
 
          Fix for http://rt.cpan.org/Ticket/Display.html?id=39078 -
          return undef from constructor when connection failed.
