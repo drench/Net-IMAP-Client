@@ -131,6 +131,8 @@ sub in_reply_to { $_[0]->{in_reply_to} }
 
 sub message_id { $_[0]->{message_id} }
 
+sub seq_id { $_[0]->{seq_id} }
+
 # utils
 
 sub get_subpart {
@@ -188,14 +190,16 @@ sub _parse_bodystructure {
     my ($self, $struct) = @_;
 
     if (ref($struct->[0]) eq 'ARRAY') {
-        my @tmp = @$struct;
-
-        pop @tmp; pop @tmp; pop @tmp; # XXX: we don't care about
-                                      # extension data of multipart
-                                      # body yet; does it actually
-                                      # contain anything interesting?
-
-        my $multipart = pop @tmp;
+        my $multipart;
+        my @tmp;
+        foreach (@$struct) {
+            if (ref($_) eq 'ARRAY') {
+                push @tmp, $_;
+            } else {
+                $multipart = $_;
+                last;           # XXX: ignoring the rest (extension data) for now.
+            }
+        }
         my $part_id = $self->{part_id} || '';
         $part_id .= '.'
           if $part_id;
@@ -437,6 +441,10 @@ Returns the flags of this message.
 =item C<uid>
 
 Returns the UID of this message.
+
+=item C<seq_id>
+
+Returns the sequence number of this message, if it has been retrieved!
 
 =item C<date>
 

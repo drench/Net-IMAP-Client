@@ -1,5 +1,32 @@
 Revision history for Net-IMAP-Client
 
+0.4      Sep 22, 2008
+
+         - added append / expunge
+
+         - added store, add_flags, del_flags, delete_message
+
+         - heavily modified _send_cmd() to support literals
+
+         - try to reconnect when connection is lost
+
+         Fixes:
+
+         - subtle bug related to using syswrite / sysread (now using
+           only buffered I/O)
+
+         - return proper notifications from get_part_body and
+           get_parts_bodies (sometimes the \Seen flag becomes set,
+           this must be reported.)
+
+         - return references in get_parts_bodies
+
+         - _parse_tokens now interprets BODY[*] as an atom
+
+         - fixed BODYSTRUCTURE parser in MsgSummary.pm (sometimes the
+           server would include additional extension data which we
+           don't support and must be properly discarded)
+
 0.3      Sep 08, 2008
 
          Fix for http://rt.cpan.org/Ticket/Display.html?id=39078 -
