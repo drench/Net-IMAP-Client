@@ -1,7 +1,7 @@
 package Net::IMAP::Client;
 
 use vars qw[$VERSION];
-$VERSION = '0.4';
+$VERSION = '0.5';
 
 use strict;
 use warnings;
@@ -322,7 +322,6 @@ sub get_parts_bodies {
 
 sub get_summaries {
     my ($self, $msg) = @_;
-    my @lines;
     if (!$msg) {
         $msg = '1:*';
     } elsif (ref $msg eq 'ARRAY') {
@@ -342,14 +341,68 @@ sub get_summaries {
     }
 }
 
+sub fetch {
+    my ($self, $msg, $keys) = @_;
+    my $wants_many = undef;
+    if (ref $msg eq 'ARRAY') {
+        $msg = join(',', @$msg);
+        $wants_many = 1;
+    }
+    if (ref $keys eq 'ARRAY') {
+        $keys = join(' ', @$keys);
+    }
+    my ($ok, $lp) = $self->_tell_imap(FETCH => qq[$msg ($keys)], 1);
+    if ($ok) {
+        my @ret;
+        foreach (@$lp) {
+            my $tokens = _parse_tokens($_)->[3];
+            push @ret, { @$tokens };
+        }
+        return $wants_many || @ret > 1 ? \@ret : $ret[0];
+    }
+}
+
+sub create_folder {
+    my ($self, $folder) = @_;
+    my $quoted = $folder;
+    _string_quote($quoted);
+    my ($ok) = $self->_tell_imap(CREATE => $quoted);
+    return $ok;
+}
+
+# recursively removes any subfolders!
+sub delete_folder {
+    my ($self, $folder) = @_;
+    my $quoted = $folder . $self->separator . '*';
+    _string_quote($quoted);
+    my ($ok, $lines) = $self->_tell_imap(LIST => qq{"" $quoted});
+    if ($ok) {
+        my @subfolders;
+        foreach my $line (@$lines) {
+            my $tokens = _parse_tokens($line);
+            push @subfolders, $tokens->[4];
+        }
+        @subfolders = sort { length($b) - length($a) } @subfolders;
+        foreach (@subfolders) {
+            _string_quote($_);
+            ($ok) = $self->_tell_imap(DELETE => $_);
+        }
+        $quoted = $folder;
+        _string_quote($quoted);
+        ($ok) = $self->_tell_imap(DELETE => $quoted);
+    }
+    return $ok;
+}
+
 sub append {
     my ($self, $folder, $rfc822, $flags, $date) = @_;
     my $quoted = $folder;
     _string_quote($quoted);
     my $args = [ "$quoted " ];
     if ($flags) {
-        my @tmp = @$flags;
-        $flags = join(' ', map { _string_quote($_) } @tmp);
+        # my @tmp = @$flags;
+        # $quoted = join(' ', map { _string_quote($_) } @tmp);
+        # push @$args, "($quoted) ";
         push @$args, '(' . join(' ', @$flags) . ') ';
     }
     if ($date) {
@@ -358,7 +411,66 @@ sub append {
         push @$args, "$tmp ";
     }
     push @$args, $rfc822;
-    my ($ok, $lines) = $self->_tell_imap(APPEND => $args, 1);
+    my ($ok) = $self->_tell_imap(APPEND => $args, 1);
+    return $ok;
+}
+
+sub copy {
+    my ($self, $msg, $folder) = @_;
+    my $quoted = $folder;
+    _string_quote($quoted);
+    if (ref $msg eq 'ARRAY') {
+        $msg = join(',', @$msg);
+    }
+    my ($ok) = $self->_tell_imap(COPY => "$msg $quoted", 1);
+    return $ok;
+}
+
+sub get_flags {
+    my ($self, $msg) = @_;
+    my $wants_many = undef;
+    if (ref($msg) eq 'ARRAY') {
+        $msg = join(',', @$msg);
+        $wants_many = 1;
+    }
+    my ($ok, $lines) = $self->_tell_imap(FETCH => "$msg FLAGS", 1);
+    if ($ok) {
+        my %ret = map {
+            my $tokens = _parse_tokens($_);
+            $tokens->[3][1], $tokens->[3][3];
+        } @$lines;
+        return $wants_many ? \%ret : $ret{$msg};
+    }
+    return undef;
+}
+
+sub get_threads {
+    my ($self, $algo, $msg) = @_;
+    $algo ||= "REFERENCES";
+    my ($ok, $lines) = $self->_tell_imap(THREAD => "$algo UTF-8 ALL");
+    if ($ok) {
+        my $result = $lines->[0][0];
+        $result =~ s/^\*\s+THREAD\s+//;
+        my $parsed = _parse_tokens([ $result ]);
+        if ($msg) {
+            (my $left = $result) =~ s/\b$msg\b.*$//;
+            my $thr = 0;
+            my $par = 0;
+            for (my $i = 0; $i < length($left); ++$i) {
+                my $c = substr($left, $i, 1);
+                if ($c eq '(') {
+                    $par++;
+                } elsif ($c eq ')') {
+                    $par--;
+                    if ($par == 0) {
+                        $thr++;
+                    }
+                }
+            }
+            $parsed = $parsed->[$thr];
+        }
+        return $parsed;
+    }
     return $ok;
 }
 
@@ -396,7 +508,14 @@ sub delete_message {
 
 sub expunge {
     my ($self) = @_;
-    $self->_send_cmd('EXPUNGE');
+    my ($ok, $lines) = $self->_tell_imap('EXPUNGE' => undef, 1);
+    if ($ok && $lines && @$lines) {
+        my $ret = $lines->[0][0];
+        if ($ret =~ /^\*\s+(\d+)\s+EXPUNGE/) {
+            return $1 + 0;
+        }
+    }
+    return $ok ? -1 : undef;
 }
 
 sub last_error {
@@ -471,15 +590,16 @@ sub _send_cmd {
     if (@literals == 0) {
         $cmd = "NIC$id $cmd" . ($args ? " $args" : '') . "\r\n";
         $socket->write($cmd);
-        # print STDERR "> $cmd";
     } else {
         $cmd = "NIC$id $cmd ";
         $socket->write($cmd);
         my @split = split(/\r\n/, $args);
+
         my $ea = each_array(@split, @literals);
         while (my ($tmp, $lit) = $ea->()) {
             $socket->write($tmp . "\r\n");
             my $line = $self->_socket_getline;
+            # print STDERR "$line - $tmp\n";
             if ($line =~ /^\+/) {
                 $socket->write($$lit);
             } else {
@@ -536,6 +656,7 @@ sub _cmd_ok2 {
     } elsif ($res =~ /^(NIC\d+)\s+(?:NO|BAD)(?:\s+(.+))?/i) {
         my $id = $1;
         my $error = $2 || 'unknown error';
+        $self->{_error} = $error;
         return ($id, 0, $error);
     }
     return ();
@@ -722,7 +843,7 @@ sub _parse_tokens {
                 my $sub = [];
                 push @{$stack[-1]}, $sub;
                 push @stack, $sub;
-            } elsif ($text =~ m/\G(BODY\[[a-zA-z0-9._-]*\])/gc) {
+            } elsif ($text =~ m/\G(BODY\[[a-zA-z0-9._() -]*\])/gc) {
                 push @{$stack[-1]}, $1; # let's consider this an atom too
             } elsif ($text =~ m/\G[])]/gc) {
                 pop @stack;
@@ -909,6 +1030,22 @@ Net::IMAP::Client - Not so simple IMAP client library
     # fetch single attachment (message part)
     my $data = $imap->get_part_body($msg_id, '1.2');
 
+    # fetch multiple attachments at once
+    my $hash = $imap->get_parts_bodies($msg_id, [ '1.2', '1.3', '2.2' ]);
+    my $part1_2 = $hash->{'1.2'};
+    my $part1_3 = $hash->{'1.3'};
+    my $part2_2 = $hash->{'2.2'};
+    print $$part1_2;              # need to dereference it
+
+    # copy messages between folders
+    $imap->select('INBOX');
+    $imap->copy(\@msg_ids, 'Archive');
+
+    # delete messages ("Move to Trash")
+    $imap->copy(\@msg_ids, 'Trash');
+    $imap->add_flags(\@msg_ids, '\\Deleted');
+    $imap->expunge;
+
 =head1 DESCRIPTION
 
 Net::IMAP::Client provides methods to access an IMAP server.  It aims
@@ -955,7 +1092,7 @@ Pass a true value if you want to use IO::Socket::SSL
 
 =item - B<uid_mode> (BOOL, optional, default TRUE)
 
-Wether to use UID command (see RFC2060).  Recommended.
+Wether to use UID command (see RFC3501).  Recommended.
 
 =item - B<socket> (IO::Handle, optional)
 
@@ -986,11 +1123,11 @@ for C<logout>.
 =head2 noop
 
 "Do nothing" method that calls the IMAP "NOOP" command.  It returns a
-true value upon success, L<undef> otherwise.
+true value upon success, I<undef> otherwise.
 
 This method fetches any notifications that the server might have for
 us and you can get them by calling $imap->notifications.  See the
-L<notifications()> method.
+L</notifications()> method.
 
 =head2 capability() / capability(qr/^SOMETHING/)
 
@@ -1028,7 +1165,7 @@ Total number of recent messages in this folder
 =item - B<sflags>
 
 Various other flags here, such as PERMANENTFLAGS of UIDVALIDITY.  You
-might want to take a look at RFC2060 at this point. :-p
+might want to take a look at RFC3501 at this point. :-p
 
 =back
 
@@ -1096,7 +1233,7 @@ It maps folder name to an hash ref containing the following:
 
 =head2 seq_to_uid(@sequence_ids)
 
-I recommend usage of UID-s only (see L<uid_mode>) but this isn't
+I recommend usage of UID-s only (see L</uid_mode>) but this isn't
 always possible.  Even when C<uid_mode> is on, the server will
 sometimes return notifications that only contain message sequence
 numbers.  To convert these to UID-s you can use this method.
@@ -1111,7 +1248,7 @@ $sort is I<undef>) and returns the results as an array reference
 containing message ID-s.
 
 Note that if you use C<$sort> and the IMAP server doesn't have this
-capability, this method will fail.  Use L<capability> to investigate.
+capability, this method will fail.  Use L</capability> to investigate.
 
 =over
 
@@ -1198,7 +1335,7 @@ Examples:
 =head2 get_part_body($msg_id, $part_id)
 
 Fetches and returns the body of a certain part of the message.  Part
-ID-s look like '1' or '1.1' or '2.3.1' etc. (see RFC2060 [1], "FETCH
+ID-s look like '1' or '1.1' or '2.3.1' etc. (see RFC3501 [1], "FETCH
 Command").
 
 =head3 Scalar reference
@@ -1436,6 +1573,38 @@ command and retrieve only those headers that you are interested in
 FETCH (FLAGS INTERNALDATE RFC822.SIZE ENVELOPE BODYSTRUCTURE)).  It's
 acceptably fast even for huge folders.
 
+=head2 fetch($msg_id, $attributes)
+
+This is a low level interface to FETCH.  It calls the imap FETCH
+command and returns a somewhat parsed hash of the results.
+
+C<$msg_id> can be a single message ID or an array of IDs.  If a single
+ID is given, the return value will be a hash reference containing the
+requested values.  If C<$msg_id> is an array, even if it contains a
+single it, then the return value will be an array of hashes.
+
+C<$attributes> is a string of attributes to FETCH, separated with a
+space, or an array (ref) of attributes.
+
+Examples:
+
+# retrieve the UID of the most recent message
+
+    my $last_uid = $imap->fetch('*', 'UID')->{UID};
+
+# fetch the flags of the first message
+
+    my $flags = $imap->fetch(1, 'FLAGS')->{FLAGS};
+
+# fetch flags and some headers (Subject and From)
+
+    my $headers = 'BODY[HEADER.FIELDS (Subject From)]';
+    my $results = $imap->fetch([1, 2, 3], "FLAGS $headers");
+    foreach my $hash (@$results) {
+        print join(" ", @{$hash->{FLAGS}}), "\n";
+        print $hash->{$headers}, "\n";
+    }
+
 =head2 notifications()
 
 The IMAP server may send various notifications upon execution of
@@ -1500,6 +1669,15 @@ I<undef> it will default to the current date/time.  B<NOTE:> this
 functionality is not tested; C<$date> should be in a format understood
 by IMAP.
 
+=head2 get_flags($msg_id) / get_flags(\@msg_ids)
+
+Returns the flags of one or more messages.  The return value is an
+array (reference) if one message ID was passed, or a hash reference if
+an array (of one or more) message ID-s was passed.
+
+When an array was passed, the returned hash will map each message ID
+to an array of flags.
+
 =head2 store($msg, $flag) / store(\@msgs, \@flags)
 
 Resets FLAGS of the given message(s) to the given flag(s).  C<$msg>
@@ -1518,7 +1696,7 @@ Examples:
 The IMAP specification defines certain reserved flags (they all start
 with a backslash).  For example, a message with the flag C<\Deleted>
 should be regarded as deleted and will be permanently discarded by an
-EXPUNGE command.  Although, it is possible to "undeleted" a message by
+EXPUNGE command.  Although, it is possible to "undelete" a message by
 removing this flag.
 
 The following reserved flags are defined by the IMAP spec:
@@ -1548,24 +1726,58 @@ Stores the \Deleted flag on the given message(s).  Equivalent to:
 
     $imap->add_flags(\@msgs, '\\Deleted');
 
-=head1 TODO
+=head2 expunge()
 
-There's a bunch of missing functionality which should be quite easy to
-add but I didn't get to it yet.  Such as create/delete folders.  If
-you need it urgently, feel free to add it and send me a patch,
-otherwise wait until I need it. :-)
+Permanently removes messages that have the C<\Deleted> flag set from
+the current folder.
+
+=head2 copy($msg, $folder) / copy(\@msg_ids, $folder)
+
+Copies message(s) from the selected folder to the given C<$folder>.
+You can pass a single message ID, or an array of message ID-s.
+
+=head2 create_folder($folder)
+
+Creates the folder with the given name.
+
+=head2 delete_folder($folder)
+
+Deletes the folder with the given name.  This works a bit different
+from the IMAP specs.  The IMAP specs says that any subfolders should
+remain intact.  This method actually deletes subfolders recursively.
+Most of the time, this is What You Want.
+
+Note that all messages in C<$folder>, as well as in any subfolders,
+are permanently lost.
+
+=head2 get_threads($algorithm, $msg_id)
+
+Returns a "threaded view" of the current folder.  Both arguments are
+optional.
+
+C<$algorithm> should be I<undef>, "REFERENCES" or "SUBJECT".  If
+undefined, "REFERENCES" is assumed.  This selects the threading
+algorithm, as per IMAP THREAD AND SORT extensions specification.  I
+only tested "REFERENCES".
+
+C<$msg_id> can be undefined, or a message ID.  If it's undefined, then
+a threaded view of the whole folder will be returned.  If you pass a
+message ID, then this method will return the top-level thread that
+contains the message.
+
+The return value is an array which actually represents threads.
+Elements of this array are message ID-s, or other arrays (which in
+turn contain message ID-s or other arrays, etc.).  The first element
+in an array will represent the start of the thread.  Subsequent
+elements are child messages or subthreads.
+
+An example should help (FIXME).
+
+=head1 TODO
 
 =over
 
 =item - authentication schemes other than plain text (B<help wanted>)
-
-=item - create/remove mailboxes
-
-=item - expunge folder
-
-=item - support THREAD operation
-
-=item - reconnect/relogin when connection lost
 
 =item - better error handling?
 
@@ -1577,12 +1789,12 @@ L<Net::IMAP::Simple>, L<Mail::IMAPClient>, L<Mail::IMAPTalk>
 
 L<Email::Simple>, L<Email::MIME>
 
-RFC2060 [1] is a must read if you want to do anything fancier than
+RFC3501 [1] is a must read if you want to do anything fancier than
 what this module already supports.
 
 =head1 REFERENCES
 
-[1] http://ietfreport.isoc.org/rfc/rfc2060.txt
+[1] http://ietfreport.isoc.org/rfc/rfc3501.txt
 
 [2] http://ietfreport.isoc.org/all-ids/draft-ietf-imapext-sort-20.txt
 

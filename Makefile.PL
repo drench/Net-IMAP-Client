@@ -13,6 +13,7 @@ WriteMakefile(
         'IO::Socket::INET'  => 0,
         'IO::Socket::SSL'   => 0,
         'List::Util'        => 0,
+        'List::MoreUtils'   => 0,
     },
     dist                => { COMPRESS => 'gzip -9f', SUFFIX => 'gz', },
     clean               => { FILES => 'Net-IMAP-Client-*' },

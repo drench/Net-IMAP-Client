@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:                Net-IMAP-Client
-version:             0.4
+version:             0.5
 abstract:            Not so simple IMAP client library
 license:             ~
 author:              
@@ -10,6 +10,7 @@ distribution_type:   module
 requires:     
     IO::Socket::INET:              0
     IO::Socket::SSL:               0
+    List::MoreUtils:               0
     List::Util:                    0
     Test::More:                    0
 meta-spec:

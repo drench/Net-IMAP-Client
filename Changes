@@ -1,5 +1,12 @@
 Revision history for Net-IMAP-Client
 
+0.5      Oct 31, 2008
+
+         - added new methods: create_folder, delete_folder, copy,
+           get_flags, get_threads, fetch
+
+         - fixed some bugs with append
+
 0.4      Sep 22, 2008
 
          - added append / expunge
