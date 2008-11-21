@@ -1,7 +1,7 @@
 package Net::IMAP::Client;
 
 use vars qw[$VERSION];
-$VERSION = '0.5';
+$VERSION = '0.6';
 
 use strict;
 use warnings;
@@ -10,6 +10,7 @@ use List::Util qw( min max first );
 use List::MoreUtils qw( each_array );
 use IO::Socket::INET ();
 use IO::Socket::SSL ();
+use Socket qw( SO_KEEPALIVE );
 
 use Net::IMAP::Client::MsgSummary ();
 
@@ -549,12 +550,15 @@ sub _get_server {
 
 sub _get_socket {
     my ($self) = @_;
-    return $self->{socket} ||= ($self->{ssl} ? 'IO::Socket::SSL' : 'IO::Socket::INET')->new(
+    my $socket = $self->{socket} ||= ($self->{ssl} ? 'IO::Socket::SSL' : 'IO::Socket::INET')->new(
         PeerAddr => $self->_get_server,
         PeerPort => $self->_get_port,
         Timeout  => $self->_get_timeout,
         Proto    => 'tcp',
+        Blocking => 1,
     );
+    $socket->sockopt(SO_KEEPALIVE, 1);
+    return $socket;
 }
 
 sub _get_next_id {
@@ -564,6 +568,11 @@ sub _get_next_id {
 sub _socket_getline {
     local $/ = "\r\n";
     return $_[0]->_get_socket->getline;
+}
+
+sub _socket_write {
+    my $self = shift;
+    $self->_get_socket->write(@_);
 }
 
 sub _send_cmd {
@@ -589,26 +598,26 @@ sub _send_cmd {
     my $socket = $self->_get_socket;
     if (@literals == 0) {
         $cmd = "NIC$id $cmd" . ($args ? " $args" : '') . "\r\n";
-        $socket->write($cmd);
+        $self->_socket_write($cmd);
     } else {
         $cmd = "NIC$id $cmd ";
-        $socket->write($cmd);
+        $self->_socket_write($cmd);
         my @split = split(/\r\n/, $args);
 
         my $ea = each_array(@split, @literals);
         while (my ($tmp, $lit) = $ea->()) {
-            $socket->write($tmp . "\r\n");
+            $self->_socket_write($tmp . "\r\n");
             my $line = $self->_socket_getline;
             # print STDERR "$line - $tmp\n";
             if ($line =~ /^\+/) {
-                $socket->write($$lit);
+                $self->_socket_write($$lit);
             } else {
                 $self->{_error} = "Expected continuation, got: $line";
                 # XXX: it's really bad if we get here, what to do?
                 return undef;
             }
         }
-        $socket->write("\r\n"); # end of command!
+        $self->_socket_write("\r\n"); # end of command!
     }
     $socket->flush;
     return "NIC$id";
@@ -663,9 +672,10 @@ sub _cmd_ok2 {
 }
 
 sub _reconnect_if_needed {
-    my ($self) = @_;
-    unless ($self->_get_socket->connected) {
+    my ($self, $force) = @_;
+    if ($force || !$self->_get_socket->connected) {
         $self->{socket} = undef;
+        $self->{greeting} = $self->_socket_getline;
         if ($self->login) {
             if ($self->{selected_folder}) {
                 $self->select($self->{selected_folder});
@@ -682,33 +692,35 @@ sub _tell_imap {
 
     $cmd = uc $cmd;
 
-    my ($lineparts, $ok);
+    my ($lineparts, $ok, $res);
 
   RETRY1: {
         $self->_send_cmd($cmd, $args);
+        redo RETRY1 if $self->_reconnect_if_needed;
+    }
 
-        $lineparts = [];
-        while (my $res = $self->_socket_getline) {
-            # print STDERR "$res";
-            if ($res =~ /^\*/) {
-                push @$lineparts, []; # this is a new line interesting in itself
-            }
-            if ($res =~ /(.*)\{(\d+)\}\r\n/) {
-                my ($line, $len) = ($1, $2 + 0);
-                push @{$lineparts->[-1]},
-                  $line,
-                    $self->_read_literal($len);
+    $lineparts = [];
+    while ($res = $self->_socket_getline) {
+        # print STDERR "$res";
+        if ($res =~ /^\*/) {
+            push @$lineparts, []; # this is a new line interesting in itself
+        }
+        if ($res =~ /(.*)\{(\d+)\}\r\n/) {
+            my ($line, $len) = ($1, $2 + 0);
+            push @{$lineparts->[-1]},
+              $line,
+                $self->_read_literal($len);
+        } else {
+            $ok = $self->_cmd_ok($res);
+            if (defined($ok)) {
+                last;
             } else {
-                $ok = $self->_cmd_ok($res);
-                if (defined($ok)) {
-                    last;
-                } else {
-                    push @{$lineparts->[-1]}, $res;
-                }
+                push @{$lineparts->[-1]}, $res;
             }
         }
-
-        redo RETRY1 if $self->_reconnect_if_needed;
+    }
+    unless (defined $res) {
+        goto RETRY1 if $self->_reconnect_if_needed(1);
     }
 
     if ($do_notf) {
@@ -757,34 +769,37 @@ sub _tell_imap2 {
         @ids = ();
         foreach (@cmd) {
             push @ids, $self->_send_cmd($_);
+            redo RETRY2 if $self->_reconnect_if_needed;
         }
+    }
 
-        %results = ();
-        for (0..$#cmd) {
-            my $lineparts = [];
-            while (my $res = $self->_socket_getline) {
-                # print STDERR "2: $res";
-                if ($res =~ /^\*/) {
-                    push @$lineparts, []; # this is a new line interesting in itself
-                }
-                if ($res =~ /(.*)\{(\d+)\}\r\n/) {
-                    my ($line, $len) = ($1, $2);
-                    push @{$lineparts->[-1]},
-                      $line,
-                        $self->_read_literal($len);
+    %results = ();
+    for (0..$#cmd) {
+        my $lineparts = [];
+        my $res;
+        while ($res = $self->_socket_getline) {
+            # print STDERR "2: $res";
+            if ($res =~ /^\*/) {
+                push @$lineparts, []; # this is a new line interesting in itself
+            }
+            if ($res =~ /(.*)\{(\d+)\}\r\n/) {
+                my ($line, $len) = ($1, $2);
+                push @{$lineparts->[-1]},
+                  $line,
+                    $self->_read_literal($len);
+            } else {
+                my ($cmdid, $ok, $error) = $self->_cmd_ok2($res);
+                if (defined($ok)) {
+                    $results{$cmdid} = [ $ok, $lineparts, $error ];
+                    last;
                 } else {
-                    my ($cmdid, $ok, $error) = $self->_cmd_ok2($res);
-                    if (defined($ok)) {
-                        $results{$cmdid} = [ $ok, $lineparts, $error ];
-                        last;
-                    } else {
-                        push @{$lineparts->[-1]}, $res;
-                    }
+                    push @{$lineparts->[-1]}, $res;
                 }
             }
         }
-
-        redo RETRY2 if $self->_reconnect_if_needed;
+        unless (defined $res) {
+            goto RETRY2 if $self->_reconnect_if_needed(1);
+        }
     }
 
     my @ret = @results{@ids};
