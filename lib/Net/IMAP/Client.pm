@@ -1,7 +1,7 @@
 package Net::IMAP::Client;
 
 use vars qw[$VERSION];
-$VERSION = '0.6';
+$VERSION = '0.7';
 
 use strict;
 use warnings;
@@ -434,11 +434,11 @@ sub get_flags {
         $msg = join(',', @$msg);
         $wants_many = 1;
     }
-    my ($ok, $lines) = $self->_tell_imap(FETCH => "$msg FLAGS", 1);
+    my ($ok, $lines) = $self->_tell_imap(FETCH => "$msg (UID FLAGS)", 1);
     if ($ok) {
         my %ret = map {
-            my $tokens = _parse_tokens($_);
-            $tokens->[3][1], $tokens->[3][3];
+            my $tokens = _parse_tokens($_)->[3];
+            $tokens->[1] => $tokens->[3];
         } @$lines;
         return $wants_many ? \%ret : $ret{$msg};
     }
@@ -1073,6 +1073,9 @@ realized that I needed to change a lot of code and API so I started it
 as a fresh module.  Still, the design is influenced by
 Net::IMAP::Simple and I even stole a few lines of code from it ;-)
 (very few, honestly).
+
+This software was developed for creating a web-based email (IMAP)
+client: www.xuheki.com.  Xhueki uses Net::IMAP::Client.
 
 =head1 API REFERENCE
 
@@ -1816,6 +1819,7 @@ what this module already supports.
 =head1 AUTHOR
 
 Mihai Bazon, <mihai.bazon@gmail.com>
+    http://www.xuheki.com/
     http://www.dynarchlib.com/
     http://www.bazon.net/mishoo/
 

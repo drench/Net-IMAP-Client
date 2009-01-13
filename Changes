@@ -1,5 +1,9 @@
 Revision history for Net-IMAP-Client
 
+0.7      Jan 13, 2009
+
+         - fixed get_flags (thanks Peter Pilsl for the report)
+
 0.6      Nov 09, 2008
 
          - better reconnect support (check that value of getline is
