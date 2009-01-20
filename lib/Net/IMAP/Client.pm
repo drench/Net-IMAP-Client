@@ -1,7 +1,7 @@
 package Net::IMAP::Client;
 
 use vars qw[$VERSION];
-$VERSION = '0.7';
+$VERSION = '0.8';
 
 use strict;
 use warnings;
@@ -119,6 +119,15 @@ sub status {
         $_ = "STATUS $_ (MESSAGES RECENT UNSEEN UIDNEXT UIDVALIDITY)";
     }
     my $results = $self->_tell_imap2(@$a);
+
+    # remove "NO CLIENT BUG DETECTED" lines as they serve no
+    # purpose beyond the religious zeal of IMAP implementors
+    for my $row (@$results) {
+        if (@{$row->[1]} > 1) {
+            $row->[1] = [ grep { $_->[0] !~ /NO CLIENT BUG DETECTED: STATUS on selected mailbox:/ } @{$row->[1]} ];
+        }
+    }
+
     my %ret;
     my $name;
     foreach my $i (@$results) {

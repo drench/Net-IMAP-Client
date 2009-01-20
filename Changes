@@ -1,5 +1,13 @@
 Revision history for Net-IMAP-Client
 
+0.8      Jan 20, 2009
+
+         - updated dependencies (Encode isn't core in Perl 5.6)
+
+         - fixed status() on uw-imap (server can return "NO CLIENT BUG
+           DETECTED ..." when called on the selected mailbox).  Thanks
+           Max Maischein (corion.net).
+
 0.7      Jan 13, 2009
 
          - fixed get_flags (thanks Peter Pilsl for the report)
