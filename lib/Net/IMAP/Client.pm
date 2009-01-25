@@ -1,7 +1,7 @@
 package Net::IMAP::Client;
 
 use vars qw[$VERSION];
-$VERSION = '0.8';
+$VERSION = '0.9';
 
 use strict;
 use warnings;
@@ -447,7 +447,8 @@ sub get_flags {
     if ($ok) {
         my %ret = map {
             my $tokens = _parse_tokens($_)->[3];
-            $tokens->[1] => $tokens->[3];
+            my %hash = @$tokens;
+            $hash{UID} => $hash{FLAGS};
         } @$lines;
         return $wants_many ? \%ret : $ret{$msg};
     }
@@ -710,7 +711,7 @@ sub _tell_imap {
 
     $lineparts = [];
     while ($res = $self->_socket_getline) {
-        # print STDERR "$res";
+        # print STDERR ">>>>$res<<<<<\n";
         if ($res =~ /^\*/) {
             push @$lineparts, []; # this is a new line interesting in itself
         }
@@ -748,7 +749,7 @@ sub _tell_imap {
             # 3. Other notifications will have a first token different
             #    from the running command
 
-            if ( $text =~ /^\*\s+\d+\s+FETCH\s*\(\s*FLAGS\s*\(.*?\)\)/
+            if ( $text =~ /^\*\s+\d+\s+FETCH\s*\(\s*FLAGS\s*\([^\)]*?\)\)/
                    || $text !~ /^\*\s+(?:\d+\s+)?$cmd/ ) {
                 my $tokens = _parse_tokens($line);
                 if ($self->_handle_notification($tokens, 1)) {
@@ -1373,7 +1374,7 @@ some time passing around potentially large data from Perl subroutines.
 
 =head3 Undecoded
 
-One other thing to note is that the data is not undecoded.  One simple
+One other thing to note is that the data is not decoded.  One simple
 way to decode it is use Email::MIME::Encodings, i.e.:
 
     use Email::MIME::Encodings;
@@ -1702,7 +1703,7 @@ Returns the flags of one or more messages.  The return value is an
 array (reference) if one message ID was passed, or a hash reference if
 an array (of one or more) message ID-s was passed.
 
-When an array was passed, the returned hash will map each message ID
+When an array was passed, the returned hash will map each message UID
 to an array of flags.
 
 =head2 store($msg, $flag) / store(\@msgs, \@flags)

@@ -1,5 +1,10 @@
 Revision history for Net-IMAP-Client
 
+0.9      Jan 25, 2009
+
+         - more fixes for cyrus imap server: get_flags and
+           get_summaries
+
 0.8      Jan 20, 2009
 
          - updated dependencies (Encode isn't core in Perl 5.6)
