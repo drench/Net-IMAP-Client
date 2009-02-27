@@ -1,7 +1,7 @@
 package Net::IMAP::Client;
 
 use vars qw[$VERSION];
-$VERSION = '0.9';
+$VERSION = '0.11';
 
 use strict;
 use warnings;
@@ -77,7 +77,6 @@ sub login {
 
 sub logout {
     my ($self) = @_;
-    $self->_send_cmd('EXPUNGE');
     $self->_send_cmd('LOGOUT');
     $self->_get_socket->close;
     return 1;
@@ -331,17 +330,37 @@ sub get_parts_bodies {
 }
 
 sub get_summaries {
-    my ($self, $msg) = @_;
+    my ($self, $msg, $headers) = @_;
     if (!$msg) {
         $msg = '1:*';
     } elsif (ref $msg eq 'ARRAY') {
         $msg = join(',', @$msg);
     }
-    my ($ok, $lp) = $self->_tell_imap(FETCH => qq[$msg (UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE BODYSTRUCTURE)], 1);
+    if ($headers) {
+        $headers = " BODY.PEEK[HEADER.FIELDS ($headers)]";
+    } else {
+        $headers = '';
+    }
+    my ($ok, $lp) = $self->_tell_imap(FETCH => qq[$msg (UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE BODYSTRUCTURE$headers)], 1);
     if ($ok) {
         my @ret;
         foreach (@$lp) {
-            my $summary = $self->_make_summary(_parse_tokens($_));
+            my $summary;
+            my $tokens = _parse_tokens($_); ## in form: [ '*', ID, 'FETCH', [ tokens ]]
+            if ($tokens->[2] eq 'FETCH') {
+                my %hash = @{$tokens->[3]};
+                if ($hash{ENVELOPE}) {
+                    # full fetch
+                    $summary = Net::IMAP::Client::MsgSummary->new(\%hash, undef, !!$headers);
+                    $summary->{seq_id} = $tokens->[1];
+                } else {
+                    # 'FETCH' (probably FLAGS) notification!
+                    $self->_handle_notification($tokens);
+                }
+            } else {
+                # notification!
+                $self->_handle_notification($tokens);
+            }
             push @ret, $summary
               if $summary;
         }
@@ -868,7 +887,7 @@ sub _parse_tokens {
                 my $sub = [];
                 push @{$stack[-1]}, $sub;
                 push @stack, $sub;
-            } elsif ($text =~ m/\G(BODY\[[a-zA-z0-9._() -]*\])/gc) {
+            } elsif ($text =~ m/\G(BODY\[[a-zA-Z0-9._() -]*\])/gc) {
                 push @{$stack[-1]}, $1; # let's consider this an atom too
             } elsif ($text =~ m/\G[])]/gc) {
                 pop @stack;
@@ -893,29 +912,6 @@ sub _parse_tokens {
     }
 
     return \@tokens;
-}
-
-sub _make_summary {
-    my ($self, $tokens) = @_;
-    ## in form: [ '*', ID, 'FETCH', [ tokens ]]
-
-    if ($tokens->[2] eq 'FETCH') {
-        my %hash = @{$tokens->[3]};
-        if ($hash{ENVELOPE}) {
-            # full fetch
-            my $summary = Net::IMAP::Client::MsgSummary->new(\%hash);
-            $summary->{seq_id} = $tokens->[1];
-            return $summary;
-        } else {
-            # 'FETCH' (probably FLAGS) notification!
-            $self->_handle_notification($tokens);
-            return undef;
-        }
-    } else {
-        # notification!
-        $self->_handle_notification($tokens);
-        return undef;
-    }
 }
 
 sub _handle_notification {

@@ -1,36 +1,46 @@
 package Net::IMAP::Client::MsgSummary;
 
+use Encode ();
 use Net::IMAP::Client::MsgAddress ();
 
-use Encode ();
-
 sub new {
-    my ($class, $data, $part_id) = @_;
+    my ($class, $data, $part_id, $has_headers) = @_;
+
     bless my $self = {}, $class;
+
     if ($part_id) {
         $self->{part_id} = $part_id;
     }
-    if ($data->{BODY}) {
-        $self->_parse_body($data->{BODY});
+
+    my $tmp = $data->{BODY};
+    if ($tmp) {
+        $self->_parse_body($tmp);
     }
-    if ($data->{BODYSTRUCTURE}) {
-        $self->_parse_bodystructure($data->{BODYSTRUCTURE});
+
+    $tmp = $data->{BODYSTRUCTURE};
+    if ($tmp) {
+        $self->_parse_bodystructure($tmp);
     }
-    if ($data->{ENVELOPE}) {
-        $self->_parse_envelope($data->{ENVELOPE});
+
+    $tmp = $data->{ENVELOPE};
+    if ($tmp) {
+        $self->_parse_envelope($tmp);
     }
-    if ($data->{FLAGS}) {
-        $self->{flags} = $data->{FLAGS};
+
+    $self->{flags} = $data->{FLAGS};
+    $self->{internaldate} = $data->{INTERNALDATE};
+    $self->{rfc822_size} = $data->{'RFC822.SIZE'};
+    $self->{uid} = $data->{UID};
+
+    if ($has_headers) {
+        while (my ($key, $val) = each %$data) {
+            if ($key =~ /^body(?:\.peek)?\s*\[\s*header\.fields/i) {
+                $self->{headers} = $val;
+                last;
+            }
+        }
     }
-    if ($data->{INTERNALDATE}) {
-        $self->{internaldate} = $data->{INTERNALDATE};
-    }
-    if ($data->{'RFC822.SIZE'}) {
-        $self->{rfc822_size} = $data->{'RFC822.SIZE'};
-    }
-    if ($data->{UID}) {
-        $self->{uid} = $data->{UID};
-    }
+
     return $self;
 }
 
@@ -89,7 +99,7 @@ sub filename {
 
 sub name { _decode($_[0]->{parameters}->{name}) }
 
-sub multipart { lc $_[0]->{multipart_type} }
+sub multipart { $_[0]->{multipart_type} }
 
 sub parts { $_[0]->{parts} }
 
@@ -133,6 +143,8 @@ sub message_id { $_[0]->{message_id} }
 
 sub seq_id { $_[0]->{seq_id} }
 
+sub headers { $_[0]->{headers} }
+
 # utils
 
 sub get_subpart {
@@ -164,7 +176,7 @@ sub _parse_body {
           if $part_id;
         my $i = 0;
         @tmp = map { __PACKAGE__->new({ BODY => $_}, $part_id . ++$i) } @tmp;
-        $self->{multipart_type} = $multipart;
+        $self->{multipart_type} = lc $multipart;
         $self->{parts} = \@tmp;
     } else {
         $self->{type} = lc $struct->[0];
@@ -205,13 +217,15 @@ sub _parse_bodystructure {
           if $part_id;
         my $i = 0;
         @tmp = map { __PACKAGE__->new({ BODYSTRUCTURE => $_}, $part_id . ++$i) } @tmp;
-        $self->{multipart_type} = $multipart;
+        $self->{multipart_type} = lc $multipart;
         $self->{parts} = \@tmp;
     } else {
         $self->{type} = lc $struct->[0];
         $self->{subtype} = lc $struct->[1];
-        if ($struct->[2]) {
-            my %tmp = @{$struct->[2]};
+        my $a = $struct->[2];
+        if ($a) {
+            __lc_key_in_array($a);
+            my %tmp = @$a;
             $self->{parameters} = \%tmp;
         }
         $self->{cid} = $struct->[3];
@@ -225,18 +239,29 @@ sub _parse_bodystructure {
             $self->_parse_bodystructure($struct->[8]);
         } elsif ($self->type ne 'text') {
             $self->{md5} = $struct->[7];
-            if ($struct->[8]) {
-                my %tmp = @{$struct->[8]};
-                foreach (values %tmp) {
-                    if (ref($_) eq 'ARRAY') {
-                        my %foo = @{$_};
-                        $_ = \%foo;
+            my $a = $struct->[8];
+            if ($a) {
+                for (my $i = 0; $i < @$a; ++$i) {
+                    $a->[$i] = lc $a->[$i];
+                    ++$i;
+                    if (ref($a->[$i]) eq 'ARRAY') {
+                        __lc_key_in_array($a->[$i]);
+                        my %foo = @{ $a->[$i] };
+                        $a->[$i] = \%foo;
                     }
                 }
+                my %tmp = @$a;
                 $self->{disposition} = \%tmp;
             }
             $self->{language} = $struct->[9];
         }
+    }
+}
+
+sub __lc_key_in_array {
+    my ($a) = @_;
+    for (my $i = 0; $i < @$a; $i += 2) {
+        $a->[$i] = lc $a->[$i];
     }
 }
 
