@@ -1,6 +1,6 @@
 Revision history for Net-IMAP-Client
 
-0.11    Feb 27, 2009
+0.91    Feb 27, 2009
 
 	Fixed get_summary to correctly identify the attachment filenames
 	with GMail's IMAP (GMail sends some headers in uppercase).
