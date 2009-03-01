@@ -1,7 +1,7 @@
 package Net::IMAP::Client;
 
 use vars qw[$VERSION];
-$VERSION = '0.91';
+$VERSION = '0.92';
 
 use strict;
 use warnings;
@@ -1395,12 +1395,19 @@ data).  Again, the data is not unencoded.
     my $parts = $imap->get_parts_bodies(10, [ '1.1', '1.2', '2.1' ]);
     print ${$parts->{'1.1'}};
 
-=head2 get_summaries($msg) / get_summaries(\@msgs)
+=head2 get_summaries($msg, $headers) / get_summaries(\@msgs, $headers)
+
+(C<$headers> is optional).
 
 Fetches, parses and returns "message summaries".  $msg can be an array
 ref, or a single id.  The return value is an array reference (in
 scalar context) or a list.  If a single message was passed, then in
 scalar context it returns only that message (not an array ref).
+
+If $headers is passed, it must be a string containing name(s) of the
+header fields to fetch (space separated).  Example:
+
+    $imap->get_summaries([1, 2, 3], 'References X-Original-To')
 
 The result contains one or more L<Net::IMAP::Client::MsgSummary>
 objects.  The best way to understand the result is to actually call

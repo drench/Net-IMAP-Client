@@ -528,6 +528,12 @@ content_type eq 'message/rfc822').  Note that it won't return true for
 the toplevel part, but you B<know> that that part represents a
 message. ;-)
 
+=item C<headers>
+
+Returns (unparsed, as plain text) additional message headers if they
+were fetched by get_summaries.  You can use L<MIME::Head> to parse
+them.
+
 =back
 
 =head1 TODO
