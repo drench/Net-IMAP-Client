@@ -1,7 +1,7 @@
 package Net::IMAP::Client;
 
 use vars qw[$VERSION];
-$VERSION = '0.92';
+$VERSION = '0.93';
 
 use strict;
 use warnings;
@@ -196,6 +196,33 @@ sub folders {
         return wantarray ? @ret : \@ret;
     }
     return undef;
+}
+
+sub _mk_namespace {
+    my ($ns) = @_;
+    if ($ns) {
+        foreach my $i (@$ns) {
+            $i = {
+                prefix => $i->[0],
+                sep    => $i->[1],
+            };
+        }
+    }
+    return $ns;
+}
+
+sub namespace {
+    my ($self) = @_;
+    my ($ok, $lines) = $self->_tell_imap('NAMESPACE');
+    if ($ok) {
+        my $ret = _parse_tokens($lines->[0]);
+        splice(@$ret, 0, 2);
+        return {
+            personal => _mk_namespace($ret->[0]),
+            other    => _mk_namespace($ret->[1]),
+            shared   => _mk_namespace($ret->[2]),
+        };
+    }
 }
 
 sub folders_more {
@@ -601,6 +628,9 @@ sub _socket_getline {
 
 sub _socket_write {
     my $self = shift;
+    # open LOG, '>>:raw', '/tmp/net-imap-client.log';
+    # print LOG @_;
+    # close LOG;
     $self->_get_socket->write(@_);
 }
 
@@ -1033,9 +1063,9 @@ Net::IMAP::Client - Not so simple IMAP client library
     }, [ 'SUBJECT', '^DATE' ]);
 
     # fetch message summaries (actually, a lot more)
-    my @summaries = $imap->get_summaries([ @msg_ids ]);
+    my $summaries = $imap->get_summaries([ @msg_ids ]);
 
-    foreach (@summaries) {
+    foreach (@$summaries) {
         print $_->uid, $_->subject, $_->date, $_->rfc822_size;
         print join(', ', @{$_->from}); # etc.
     }
@@ -1255,6 +1285,27 @@ It maps folder name to an hash ref containing the following:
   - sep   -- one character containing folder hierarchy separator
   - name  -- folder name (same as the key -- thus redundant)
 
+=head2 namespace
+
+Returns an hash reference containing the namespaces for this server
+(see RFC 2342).  Since the RFC defines 3 possible types of namespaces,
+the hash contains the following keys:
+
+ - `personal' -- the personal namespace
+ - `other' -- "other users" namespace
+ - `shared' -- shared namespace
+
+Each one can be I<undef> if the server returned "NIL", or an array
+reference.  If an array reference, each element is in the form:
+
+ {
+    sep    => '.',
+    prefix => 'INBOX.'
+ }
+
+(I<sep> is the separator for this hierarchy, and I<prefix> is the
+prefix).
+
 =head2 seq_to_uid(@sequence_ids)
 
 I recommend usage of UID-s only (see L</uid_mode>) but this isn't
@@ -1374,7 +1425,7 @@ One other thing to note is that the data is not decoded.  One simple
 way to decode it is use Email::MIME::Encodings, i.e.:
 
     use Email::MIME::Encodings;
-    my $summary = $imap->get_summaries(10);
+    my $summary = $imap->get_summaries(10)->[0];
     my $part = $summary->get_subpart('1.1');
     my $body = $imap->get_part_body('1.1');
     my $cte = $part->transfer_encoding;  # Content-Transfer-Encoding
@@ -1400,18 +1451,17 @@ data).  Again, the data is not unencoded.
 (C<$headers> is optional).
 
 Fetches, parses and returns "message summaries".  $msg can be an array
-ref, or a single id.  The return value is an array reference (in
-scalar context) or a list.  If a single message was passed, then in
-scalar context it returns only that message (not an array ref).
+ref, or a single id.  The return value is always an array reference,
+even if a single message is queried.
 
 If $headers is passed, it must be a string containing name(s) of the
 header fields to fetch (space separated).  Example:
 
     $imap->get_summaries([1, 2, 3], 'References X-Original-To')
 
-The result contains one or more L<Net::IMAP::Client::MsgSummary>
-objects.  The best way to understand the result is to actually call
-this function and use Data::Dumper to see its structure.
+The result contains L<Net::IMAP::Client::MsgSummary> objects.  The
+best way to understand the result is to actually call this function
+and use Data::Dumper to see its structure.
 
 Following is the output for a pretty complicated message, which
 contains an HTML part with an embedded image and an attached message.

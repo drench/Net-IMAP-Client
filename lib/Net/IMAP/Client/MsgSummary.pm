@@ -190,7 +190,7 @@ sub _parse_body {
         $self->{transfer_encoding} = $struct->[5];
         $self->{encoded_size} = $struct->[6];
 
-        if ($self->is_message) {
+        if ($self->is_message && $struct->[7] && $struct->[8]) {
             # continue parsing attached message
             $self->_parse_envelope($struct->[7]);
             $self->_parse_body($struct->[8]);
@@ -233,7 +233,7 @@ sub _parse_bodystructure {
         $self->{transfer_encoding} = $struct->[5];
         $self->{encoded_size} = $struct->[6];
 
-        if ($self->is_message) {
+        if ($self->is_message && $struct->[7] && $struct->[8]) {
             # continue parsing attached message
             $self->_parse_envelope($struct->[7]);
             $self->_parse_bodystructure($struct->[8]);
