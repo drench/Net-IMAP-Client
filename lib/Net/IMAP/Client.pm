@@ -1,7 +1,7 @@
 package Net::IMAP::Client;
 
 use vars qw[$VERSION];
-$VERSION = '0.93';
+$VERSION = '0.95';
 
 use strict;
 use warnings;
@@ -48,7 +48,7 @@ sub DESTROY {
     my ($self) = @_;
     eval {
         $self->quit
-          if $self->_get_socket->opened;
+          if $self->{socket}->opened;
     };
 }
 
@@ -139,14 +139,25 @@ sub status {
             $ret{$name} = \%tmp;
         }
     }
-    return $wants_one ? $ret{$name} : \%ret;
+    return $wants_one 
+        ? (defined $name and $ret{$name})  # avoid data on undef key
+        : \%ret;
 }
 
 sub select {
-    my ($self, $folder) = @_;
+	my ($self, $folder) = @_;
+	$self->_select_or_examine($folder, 'SELECT');
+}
+sub examine {
+	my ($self, $folder) = @_;
+	$self->_select_or_examine($folder, 'EXAMINE');
+}
+
+sub _select_or_examine {
+    my ($self, $folder, $operation) = @_;
     my $quoted = $folder;
     _string_quote($quoted);
-    my ($ok, $lines) = $self->_tell_imap(SELECT => $quoted);
+    my ($ok, $lines) = $self->_tell_imap($operation => $quoted);
     if ($ok) {
         $self->{selected_folder} = $folder;
         my %info = ();
@@ -452,6 +463,8 @@ sub delete_folder {
 
 sub append {
     my ($self, $folder, $rfc822, $flags, $date) = @_;
+    die 'message body passed to append() must be a SCALAR reference'
+        unless ref $rfc822 eq 'SCALAR';
     my $quoted = $folder;
     _string_quote($quoted);
     my $args = [ "$quoted " ];
@@ -577,6 +590,7 @@ sub expunge {
 
 sub last_error {
     my ($self) = @_;
+    $self->{_error} =~ s/\s+$//s; # remove trailing carriage return
     return $self->{_error};
 }
 
@@ -709,7 +723,7 @@ sub _cmd_ok {
         return 1;
     } elsif ($res =~ /^NIC$id\s+(?:NO|BAD)(?:\s+(.+))?/i) {
         my $error = $1 || 'unknown error';
-	$self->{_error} = $error;
+        $self->{_error} = $error;
         return 0;
     }
     return undef;
@@ -758,15 +772,21 @@ sub _tell_imap {
         redo RETRY1 if $self->_reconnect_if_needed;
     }
 
-    $lineparts = [];
+    $lineparts = [];      # holds results in boxes
+    my $accumulator = []; # box for collecting results
     while ($res = $self->_socket_getline) {
         # print STDERR ">>>>$res<<<<<\n";
+
         if ($res =~ /^\*/) {
-            push @$lineparts, []; # this is a new line interesting in itself
+
+            # store previous box and start a new one
+
+            push @$lineparts, $accumulator if @$accumulator;
+            $accumulator = []; 
         }
         if ($res =~ /(.*)\{(\d+)\}\r\n/) {
             my ($line, $len) = ($1, $2 + 0);
-            push @{$lineparts->[-1]},
+            push @$accumulator,
               $line,
                 $self->_read_literal($len);
         } else {
@@ -774,10 +794,13 @@ sub _tell_imap {
             if (defined($ok)) {
                 last;
             } else {
-                push @{$lineparts->[-1]}, $res;
+                push @$accumulator, $res;
             }
         }
     }
+    # store last box
+    push @$lineparts, $accumulator if @$accumulator;
+
     unless (defined $res) {
         goto RETRY1 if $self->_reconnect_if_needed(1);
     }
@@ -835,15 +858,17 @@ sub _tell_imap2 {
     %results = ();
     for (0..$#cmd) {
         my $lineparts = [];
+        my $accumulator = [];
         my $res;
         while ($res = $self->_socket_getline) {
             # print STDERR "2: $res";
             if ($res =~ /^\*/) {
-                push @$lineparts, []; # this is a new line interesting in itself
+                push @$lineparts, $accumulator if @$accumulator;
+                $accumulator = []; 
             }
             if ($res =~ /(.*)\{(\d+)\}\r\n/) {
                 my ($line, $len) = ($1, $2);
-                push @{$lineparts->[-1]},
+                push @$accumulator,
                   $line,
                     $self->_read_literal($len);
             } else {
@@ -852,10 +877,11 @@ sub _tell_imap2 {
                     $results{$cmdid} = [ $ok, $lineparts, $error ];
                     last;
                 } else {
-                    push @{$lineparts->[-1]}, $res;
+                    push @$accumulator, $res;
                 }
             }
         }
+        push @$lineparts, $accumulator if @$accumulator;
         unless (defined $res) {
             goto RETRY2 if $self->_reconnect_if_needed(1);
         }
@@ -929,7 +955,7 @@ sub _parse_tokens {
                 push @{$stack[-1]}, $str; # found string
             } elsif ($text =~ m/\G(\d+)/gc) {
                 push @{$stack[-1]}, $1 + 0; # found numeric
-            } elsif ($text =~ m/\G([a-zA-Z0-9_\$\\.+\/*-]+)/gc) {
+            } elsif ($text =~ m/\G([a-zA-Z0-9_\$\\.+\/*&-]+)/gc) {
                 my $atom = $1;
                 if (lc $atom eq 'nil') {
                     $atom = undef;
@@ -1225,6 +1251,11 @@ might want to take a look at RFC3501 at this point. :-p
 
 This method is basically stolen from Net::IMAP::Simple.
 
+=head2 examine($folder)
+
+Selects the current IMAP folder in read-only (EXAMINE) mode.
+Otherwise identical to select.
+ 
 =head2 status($folder), status(\@folders)
 
 Returns the status of the given folder(s).
@@ -1736,7 +1767,7 @@ of them will receive "RECENT" notifications; others will have to rely
 on "EXISTS" to tell when new messages have arrived.  Therefore I can
 only say that "RECENT" is useless and I advise you to ignore it.
 
-=head2 append($folder, $rfc822, $flags, $date)
+=head2 append($folder, \$rfc822, $flags, $date)
 
 Appends a message to the given C<$folder>.  You must pass the full
 RFC822 body in C<$rfc822>.  C<$flags> and C<$date> are optional.  If
